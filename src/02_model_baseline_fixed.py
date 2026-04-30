@@ -77,9 +77,7 @@ def har_eval_soft_half_python(drift_series, label_series, k):
         TP += best
         FP += (1.0 - best)
 
-    for t in goal_pos:
-        if not any((t - k) <= a <= t for a in alarm_pos):
-            FN += 1.0
+    FN = len(goal_pos) - TP
 
     TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
