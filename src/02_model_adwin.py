@@ -100,8 +100,8 @@ def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, warmup_minutes
 def har_eval_soft_half_python(drift_series, label_series, k):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
-    score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t]
-    score(alarme) = 0 (FP)                     caso contrário
+    score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
+    FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
     Não usa R/harbinger — avaliação puramente em Python.
     """
     import numpy as np
@@ -115,16 +115,14 @@ def har_eval_soft_half_python(drift_series, label_series, k):
         for t in goal_pos:
             if (t - k) <= a <= t:
                 best = max(best, 1.0 - (a - (t - k)) / k)
-        if best > 0:
-            TP += best
-        else:
-            FP += 1.0
+        TP += best
+        FP += (1.0 - best)
 
     for t in goal_pos:
         if not any((t - k) <= a <= t for a in alarm_pos):
             FN += 1.0
 
-    TN = max(len(drift_series) - len(alarm_pos) - FN, 0)
+    TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
