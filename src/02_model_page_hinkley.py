@@ -129,7 +129,7 @@ def get_detector_products():
         "threshold": [1, 3, 5, 7, 10],
         "delta": [0.001, 0.005, 0.01],
         "alpha": [0.9, 0.95, 0.99],
-        "mode": ["up", "down"],
+        "mode": ["both"],
     }
     return [
         {"detector": "PageHinkley", "params": dict(zip(params.keys(), combo))}
