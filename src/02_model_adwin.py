@@ -8,6 +8,7 @@ Análise em notebooks/
 # 0. IMPORTS
 # =========================
 import pandas as pd
+import numpy as np
 import json
 import time
 import hashlib
@@ -37,8 +38,7 @@ WINDOW_MA_OPTIONS = [3, 5, 10, 12, 15]
 COOLDOWN_OPTIONS = [3, 5, 10, 12, 15]
 
 K = 10
-# Warmup = 0 porque window_ma atua duplamente como janela da média móvel e como warmup
-WARMUP_MINUTES = 0
+
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
@@ -50,7 +50,7 @@ RUN_DATE = datetime.today().date().isoformat()
 TEAMS = None
 EXPERIMENT_TAG = "todos_times"
 FORCE_RERUN = True
-TEST_LABEL = "ADWIN TP corrigido + cooldown/warmup corrigido"
+TEST_LABEL = "ADWIN - TP/FP/TN/FN e window_ma corrigidos"
 # True = grid reduzido (1 delta) para tuning rápido; False = grid completo
 FAST_GRID = False
 
@@ -63,15 +63,14 @@ def generate_experiment_id(base, task, feature, detector, params, k, tag):
 
 
 def compute_ma_per_period(series_per_period, window_ma=10):
-    import numpy as np
     arr = np.asarray(series_per_period, dtype=float)
     return pd.Series(arr).rolling(window=window_ma, min_periods=1).mean().values
 
 
-def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, warmup_minutes=0, window_ma=10):
+def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10):
     """
     ADWIN na série já suavizada (MA) + cooldown + warmup.
-    Mesma lógica de janela inicial que só alimenta após window_ma amostras, ou seja, window_ma opera como warmup, por isso warmup = 0.
+    Só alimenta o detector a partir do índice window_ma (evita pico quando a MA completa), ou seja, window_ma funciona como warmup.
     """
     detector = drift.ADWIN(**params)
     out_drift = []
@@ -82,45 +81,63 @@ def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, warmup_minutes
         if cooldown_remaining > 0:
             cooldown_remaining -= 1
         if i >= ma_start:
-            detector.update(float(v))
+            detector.update(v)
             raw_drift = detector.drift_detected
             if raw_drift:
                 detector = drift.ADWIN(**params)
+            if raw_drift and cooldown_remaining == 0:
+                out_drift.append(True)
+                cooldown_remaining = cooldown_minutes
+            else:
+                out_drift.append(False)
         else:
-            raw_drift = False
-        in_warmup = i < warmup_minutes
-        if raw_drift and cooldown_remaining == 0 and not in_warmup:
-            out_drift.append(True)
-            cooldown_remaining = cooldown_minutes
-        else:
-            out_drift.append(False)
+            out_drift.append(False)        
     return out_drift
 
 
-def har_eval_soft_half_python(drift_series, label_series, k):
+def har_eval_soft_half_python(drift_series, label_series, k, window_ma=0):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
     score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
     FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
-    Não usa R/harbinger — avaliação puramente em Python.
+    Não usa R/harbinger — avaliação puramente em Python, pois harbinger não permitia usar a pirâmide parcialmente.
+    Os primeiros window_ma minutos de cada período são excluídos da análise (warmup da MA).
     """
-    import numpy as np
-    goal_pos  = np.where(np.array(label_series, dtype=bool))[0]
-    alarm_pos = np.where(np.array(drift_series, dtype=bool))[0]
+
+    # converte pra array e trata NaN
+    drift_arr = np.array(drift_series, dtype=float)
+    label_arr = np.array(label_series, dtype=float)
+    drift_arr = np.where(np.isnan(drift_arr), 0.0, drift_arr).astype(bool)
+    label_arr = np.where(np.isnan(label_arr), 0.0, label_arr).astype(bool)
+
+    # exclui primeiros window_ma minutos (warmup): posições originais preservadas
+    goal_pos  = np.where(label_arr[window_ma:])[0] + window_ma
+    alarm_pos = np.where(drift_arr[window_ma:])[0] + window_ma
+    effective_n = len(drift_series) - window_ma
+
+    # caso extremo sem gols ou sem alarmes
+    # sem alarmes: TP, FP são 0, FN = len(goal_pos), TN = effective_n - FN (#gols)
+    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = effective_n - FP (#alarmes)
+    if len(alarm_pos) == 0 or len(goal_pos) == 0:
+        TP, FP = 0.0, float(len(alarm_pos))
+        FN = float(len(goal_pos))
+        TN = float(effective_n - len(goal_pos)) - FP
+        return TP, FP, FN, TN
 
     TP, FP, FN = 0.0, 0.0, 0.0
 
+    # score sempre começa com 0
+    # max garante que se o alarme cobre múltiplos gols, pega o melhor score
     for a in alarm_pos:
-        best = 0.0
+        score = 0.0
         for t in goal_pos:
             if (t - k) <= a <= t:
-                best = max(best, 1.0 - (a - (t - k)) / k)
-        TP += best
-        FP += (1.0 - best)
+                score = max(score, 1.0 - (a - (t - k)) / k)
+        TP += score
+        FP += (1.0 - score)
 
     FN = len(goal_pos) - TP
-
-    TN = (len(drift_series) - len(goal_pos)) - FP
+    TN = (effective_n - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
@@ -162,6 +179,10 @@ def _agg_best(df_agg, group_cols):
     df_agg["precision"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FP_sum"])
     df_agg["recall"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FN_sum"])
     df_agg["f1"] = 2 * df_agg["precision"] * df_agg["recall"] / (df_agg["precision"] + df_agg["recall"])
+    # fillna(0) trata os casos
+    # TP_sum + FP_sum = 0 no precision
+    # TP_sum + FN_sum = 0 no recall
+    # precision + recall = 0 no f1
     df_agg = df_agg.fillna(0)
     best_idx = df_agg.groupby(group_cols)["f1"].idxmax()
     return df_agg.loc[best_idx].copy()
@@ -215,12 +236,18 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
                             mask = df_ctx["period"] == period
                             ma_vals = ma_series.loc[mask].tolist()
                             drifts = drift_detection_on_ma(
-                                ma_vals, det["params"], cooldown_minutes, WARMUP_MINUTES, window_ma
+                                ma_vals, det["params"], cooldown_minutes, window_ma
                             )
                             for i, idx in enumerate(df_ctx.loc[mask].index):
                                 drift_series.loc[idx] = drifts[i]
                         drift_series = drift_series.astype(bool)
-                        TP, FP, FN, TN = har_eval_soft_half_python(drift_series, goal_series, k)
+                        TP, FP, FN, TN = 0.0, 0.0, 0.0, 0.0
+                        for period in sorted(df_ctx["period"].unique()):
+                            mask = df_ctx["period"] == period
+                            tp, fp, fn, tn = har_eval_soft_half_python(
+                                drift_series[mask], goal_series[mask], k, window_ma
+                            )
+                            TP += tp; FP += fp; FN += fn; TN += tn
                         results.append({
                             "run_date": RUN_DATE,
                             "match_id": match_id,

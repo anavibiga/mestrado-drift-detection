@@ -49,7 +49,7 @@ RUN_DATE = datetime.today().date().isoformat()
 TEAMS = None
 EXPERIMENT_TAG = "todos_times"
 FORCE_RERUN = True
-TEST_LABEL = "Page-Hinkley meio_softed"
+TEST_LABEL = "Page-Hinkley - TP/FP/TN/FN e window_ma corrigidos"
 
 # ==============================
 # 2. FUNCTIONS
@@ -92,12 +92,13 @@ def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10):
     return out_drift
 
 
-def har_eval_soft_half_python(drift_series, label_series, k):
+def har_eval_soft_half_python(drift_series, label_series, k, window_ma=0):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
     score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
     FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
     Não usa R/harbinger — avaliação puramente em Python, pois harbinger não permitia usar a pirâmide parcialmente.
+    Os primeiros window_ma minutos de cada período são excluídos da análise (warmup da MA).
     """
 
     # converte pra array e trata NaN
@@ -106,18 +107,18 @@ def har_eval_soft_half_python(drift_series, label_series, k):
     drift_arr = np.where(np.isnan(drift_arr), 0.0, drift_arr).astype(bool)
     label_arr = np.where(np.isnan(label_arr), 0.0, label_arr).astype(bool)
 
-    # índice da posição temporal dos gols
-    goal_pos  = np.where(label_arr)[0]
-    # índice da posição temporal dos alarmes
-    alarm_pos = np.where(drift_arr)[0]
+    # exclui primeiros window_ma minutos (warmup): posições originais preservadas
+    goal_pos  = np.where(label_arr[window_ma:])[0] + window_ma
+    alarm_pos = np.where(drift_arr[window_ma:])[0] + window_ma
+    effective_n = len(drift_series) - window_ma
 
     # caso extremo sem gols ou sem alarmes
-    # sem alarmes: TP, FP são 0, FN = len(gols_pos), TN = len(drift_series) - FN (#gols)
-    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = len(drift_series) - FP (#alarmes)
+    # sem alarmes: TP, FP são 0, FN = len(goal_pos), TN = effective_n - FN (#gols)
+    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = effective_n - FP (#alarmes)
     if len(alarm_pos) == 0 or len(goal_pos) == 0:
         TP, FP = 0.0, float(len(alarm_pos))
         FN = float(len(goal_pos))
-        TN = float(len(drift_series) - len(goal_pos)) - FP
+        TN = float(effective_n - len(goal_pos)) - FP
         return TP, FP, FN, TN
 
     TP, FP, FN = 0.0, 0.0, 0.0
@@ -133,7 +134,7 @@ def har_eval_soft_half_python(drift_series, label_series, k):
         FP += (1.0 - score)
 
     FN = len(goal_pos) - TP
-    TN = (len(drift_series) - len(goal_pos)) - FP
+    TN = (effective_n - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
@@ -172,12 +173,10 @@ def _agg_best(df_agg, group_cols):
     df_agg["precision"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FP_sum"])
     df_agg["recall"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FN_sum"])
     df_agg["f1"] = 2 * df_agg["precision"] * df_agg["recall"] / (df_agg["precision"] + df_agg["recall"])
-    """"
-    fillna(0) trata os casos
-    TP_sum + FP_sum = 0 no precision
-    TP_sum + FN_sum = 0 no recall
-    precision + recall = 0 no f1
-    """
+    # fillna(0) trata os casos
+    # TP_sum + FP_sum = 0 no precision
+    # TP_sum + FN_sum = 0 no recall
+    # precision + recall = 0 no f1
     df_agg = df_agg.fillna(0)
     best_idx = df_agg.groupby(group_cols)["f1"].idxmax()
     return df_agg.loc[best_idx].copy()
@@ -240,7 +239,7 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
                         for period in sorted(df_ctx["period"].unique()):
                             mask = df_ctx["period"] == period
                             tp, fp, fn, tn = har_eval_soft_half_python(
-                                drift_series[mask], goal_series[mask], k
+                                drift_series[mask], goal_series[mask], k, window_ma
                             )
                             TP += tp; FP += fp; FN += fn; TN += tn
                         results.append({

@@ -82,22 +82,34 @@ def har_eval_soft_half_python(drift_series, label_series, k):
     FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
     Não usa R/harbinger — avaliação puramente em Python.
     """
-    import numpy as np
-    goal_pos  = np.where(np.array(label_series, dtype=bool))[0]
-    alarm_pos = np.where(np.array(drift_series, dtype=bool))[0]
+    drift_arr = np.array(drift_series, dtype=float)
+    label_arr = np.array(label_series, dtype=float)
+    drift_arr = np.where(np.isnan(drift_arr), 0.0, drift_arr).astype(bool)
+    label_arr = np.where(np.isnan(label_arr), 0.0, label_arr).astype(bool)
+
+    goal_pos  = np.where(label_arr)[0]
+    alarm_pos = np.where(drift_arr)[0]
+
+    # caso extremo sem gols ou sem alarmes
+    # sem alarmes: TP, FP são 0, FN = len(goal_pos), TN = len(drift_series) - FN (#gols)
+    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = len(drift_series) - FP (#alarmes)
+    if len(alarm_pos) == 0 or len(goal_pos) == 0:
+        TP, FP = 0.0, float(len(alarm_pos))
+        FN = float(len(goal_pos))
+        TN = float(len(drift_series) - len(goal_pos)) - FP
+        return TP, FP, FN, TN
 
     TP, FP, FN = 0.0, 0.0, 0.0
 
     for a in alarm_pos:
-        best = 0.0
+        score = 0.0
         for t in goal_pos:
             if (t - k) <= a <= t:
-                best = max(best, 1.0 - (a - (t - k)) / k)
-        TP += best
-        FP += (1.0 - best)
+                score = max(score, 1.0 - (a - (t - k)) / k)
+        TP += score
+        FP += (1.0 - score)
 
     FN = len(goal_pos) - TP
-
     TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
@@ -195,7 +207,13 @@ def run_team(df_team, team, k, alarm_prob, run_number, seed):
                         for i, idx in enumerate(df_ctx.loc[mask].index):
                             drift_series.loc[idx] = alarms[i]
                     drift_series = drift_series.astype(bool)
-                    TP, FP, FN, TN = har_eval_soft_half_python(drift_series, goal_series, k)
+                    TP, FP, FN, TN = 0.0, 0.0, 0.0, 0.0
+                    for period in sorted(df_ctx["period"].unique()):
+                        mask = df_ctx["period"] == period
+                        tp, fp, fn, tn = har_eval_soft_half_python(
+                            drift_series[mask], goal_series[mask], k
+                        )
+                        TP += tp; FP += fp; FN += fn; TN += tn
                     results.append({
                         "run_date": RUN_DATE,
                         "match_id": match_id,
