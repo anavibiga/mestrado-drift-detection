@@ -29,7 +29,7 @@ RESULTS_BEST_FILE = RESULTS_PATH / "results_best.parquet"
 RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"
 RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 
-TARGET_ALARMS = 12000  # calibrado para ~4000 alarmes após filtro best-per-team/task (1/3 das features é mantida)
+TARGET_ALARMS = 8000   # igualado ao volume do Page-Hinkley para comparação justa
 RANDOM_SEED = 42       # reprodutibilidade
 N_RUNS = 10            # repetições para estimar variância do baseline aleatório
 
