@@ -32,13 +32,9 @@ RESULTS_BEST_FILE = RESULTS_PATH / "results_best.parquet"
 RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"
 RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 
-# Configurações do Warmup e do Cooldown
 WINDOW_MA_OPTIONS = [3, 5, 10, 12, 15]
-COOLDOWN_OPTIONS = [3, 5, 10, 12, 15]
 
 K = 10
-# Warmup = 0 porque window_ma atua duplamente como janela da média móvel e como warmup
-WARMUP_MINUTES = 0
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
@@ -66,59 +62,76 @@ def compute_ma_per_period(series_per_period, window_ma=10):
     return pd.Series(arr).rolling(window=window_ma, min_periods=1).mean().values
 
 
-def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, warmup_minutes=0, window_ma=10):
+def drift_detection_on_ma(ma_values, params, window_ma=10):
     """
-    Page-Hinkley na série já suavizada (MA) + cooldown + warmup.
-    Só alimenta o detector a partir do índice window_ma (evita pico quando a MA completa), ou seja, window_ma funciona como warmup, por isso warmup zerado.
+    Page-Hinkley na série já suavizada (MA).
+    Só alimenta o detector a partir do índice window_ma (warmup implícito).
     """
     detector = drift.PageHinkley(**params)
     out_drift = []
-    cooldown_remaining = 0
-    ma_start = window_ma
-
     for i, v in enumerate(ma_values):
-        if cooldown_remaining > 0:
-            cooldown_remaining -= 1
-        if i >= ma_start:
+        if i >= window_ma:
             detector.update(v)
             raw_drift = detector.drift_detected
             if raw_drift:
                 detector = drift.PageHinkley(**params)
         else:
             raw_drift = False
-        in_warmup = i < warmup_minutes
-        if raw_drift and cooldown_remaining == 0 and not in_warmup:
-            out_drift.append(True)
-            cooldown_remaining = cooldown_minutes
-        else:
-            out_drift.append(False)
+        out_drift.append(raw_drift)
     return out_drift
 
 
 def har_eval_soft_half_python(drift_series, label_series, k):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
-    score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
-    FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
-    Não usa R/harbinger — avaliação puramente em Python, pois harbinger não permitia usar a pirâmide parcialmente.
+    Associação ótima alarme↔gol via Hungarian algorithm (scipy).
+    FP = 1 - score, FN = m - TP, TN = (t - m) - FP.
     """
+    from scipy.optimize import linear_sum_assignment
     import numpy as np
+
     goal_pos  = np.where(np.array(label_series, dtype=bool))[0]
     alarm_pos = np.where(np.array(drift_series, dtype=bool))[0]
 
-    TP, FP, FN = 0.0, 0.0, 0.0
+    if len(alarm_pos) == 0 or len(goal_pos) == 0:
+        FP = float(len(alarm_pos))
+        FN = float(len(goal_pos))
+        TN = float(len(drift_series) - len(goal_pos)) - FP
+        return 0.0, FP, FN, TN
 
-    for a in alarm_pos:
-        best = 0.0
-        for t in goal_pos:
-            if (t - k) <= a <= t:
-                best = max(best, 1.0 - (a - (t - k)) / k)
-        TP += best
-        FP += (1.0 - best)
+    def score(a, t):
+        if (t - k) <= a <= t:
+            return 1.0 - (a - (t - k)) / k
+        return 0.0
 
-    FN = len(goal_pos) - TP
+    segs = [[int(t) - k, int(t)] for t in goal_pos]
+    merged = [segs[0][:]]
+    for seg in segs[1:]:
+        if seg[0] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], seg[1])
+        else:
+            merged.append(seg[:])
 
-    TN = (len(drift_series) - len(goal_pos)) - FP
+    S_d = np.zeros(len(alarm_pos))
+    for inf, sup in merged:
+        D_idx = np.where((alarm_pos >= inf) & (alarm_pos <= sup))[0]
+        E_idx = np.where((goal_pos  >= inf) & (goal_pos  <= sup))[0]
+        if len(D_idx) == 0:
+            continue
+        D_mini = alarm_pos[D_idx]
+        E_mini = goal_pos[E_idx]
+        if len(D_mini) == 1 and len(E_mini) == 1:
+            S_d[D_idx[0]] = score(D_mini[0], E_mini[0])
+        elif len(E_mini) >= 1:
+            Mu = np.array([[score(a, t) for t in E_mini] for a in D_mini])
+            row_ind, col_ind = linear_sum_assignment(-Mu)
+            for r, c in zip(row_ind, col_ind):
+                S_d[D_idx[r]] = Mu[r, c]
+
+    TP = float(np.sum(S_d))
+    FP = float(np.sum(1.0 - S_d))
+    FN = float(len(goal_pos)) - TP
+    TN = float(len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
@@ -144,7 +157,7 @@ def append_parquet(df_new, path):
         df_old = pd.read_parquet(path)
         df_new = pd.concat([df_old, df_new], ignore_index=True)
     first_cols = []
-    for col in ["run_timestamp", "test_label", "window_ma", "cooldown_minutes", "side"]:
+    for col in ["run_timestamp", "test_label", "window_ma", "side"]:
         if col in df_new.columns:
             first_cols.append(col)
     if first_cols:
@@ -163,23 +176,23 @@ def _agg_best(df_agg, group_cols):
 
 
 def _worker_run_team(args):
-    team, df_team, detector_products, k, window_ma, cooldown_minutes = args
-    res = run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes)
+    team, df_team, detector_products, k, window_ma = args
+    res = run_team(df_team, team, detector_products, k, window_ma)
     res["params"] = res["params"].astype(str)
     df_agg = (
-        res.groupby(["team", "task", "goal_type", "feature", "detector", "params", "window_ma", "cooldown_minutes"], as_index=False)
+        res.groupby(["team", "task", "goal_type", "feature", "detector", "params", "window_ma"], as_index=False)
         .agg(TP_sum=("TP", "sum"), FP_sum=("FP", "sum"), FN_sum=("FN", "sum"), TN_sum=("TN", "sum"))
     )
     df_best = _agg_best(df_agg, ["team", "task", "goal_type"])
     df_agg_side = (
-        res.groupby(["team", "task", "goal_type", "side", "feature", "detector", "params", "window_ma", "cooldown_minutes"], as_index=False)
+        res.groupby(["team", "task", "goal_type", "side", "feature", "detector", "params", "window_ma"], as_index=False)
         .agg(TP_sum=("TP", "sum"), FP_sum=("FP", "sum"), FN_sum=("FN", "sum"), TN_sum=("TN", "sum"))
     )
     df_best_side = _agg_best(df_agg_side, ["team", "task", "goal_type", "side"])
     return df_best, df_best_side, res
 
 
-def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
+def run_team(df_team, team, detector_products, k, window_ma):
     results = []
     for match_id in df_team["match_id"].unique():
         df_match = df_team[df_team["match_id"] == match_id]
@@ -209,9 +222,7 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
                         for period in sorted(df_ctx["period"].unique()):
                             mask = df_ctx["period"] == period
                             ma_vals = ma_series.loc[mask].tolist()
-                            drifts = drift_detection_on_ma(
-                                ma_vals, det["params"], cooldown_minutes, WARMUP_MINUTES, window_ma
-                            )
+                            drifts = drift_detection_on_ma(ma_vals, det["params"], window_ma)
                             for i, idx in enumerate(df_ctx.loc[mask].index):
                                 drift_series.loc[idx] = drifts[i]
                         drift_series = drift_series.astype(bool)
@@ -227,7 +238,6 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
                             "detector": det["detector"],
                             "params": json.dumps(det["params"]),
                             "window_ma": window_ma,
-                            "cooldown_minutes": cooldown_minutes,
                             "TP": TP, "FP": FP, "FN": FN, "TN": TN,
                         })
     return pd.DataFrame(results)
@@ -236,9 +246,8 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
 # 3. MAIN
 # ==============================
 if __name__ == "__main__":
-    n_combos = len(WINDOW_MA_OPTIONS) * len(COOLDOWN_OPTIONS)
-    print("=== 02_model: Page-Hinkley | janela MA × cooldown | by_side ===")
-    print(f"Drift (MA): {WINDOW_MA_OPTIONS} | Cooldown: {COOLDOWN_OPTIONS} | Combinações: {n_combos}")
+    print("=== 02_model: Page-Hinkley | janela MA | Hungarian | sem cooldown ===")
+    print(f"Drift (MA): {WINDOW_MA_OPTIONS}")
     print(f"Resultados: {RESULTS_BEST_FILE}")
     print(f"Por lado: {RESULTS_BEST_BY_SIDE_FILE}")
     detector_products = get_detector_products()
@@ -260,22 +269,18 @@ if __name__ == "__main__":
     else:
         pending_teams = teams
 
-    total_work = n_combos * len(pending_teams)
-    print(f"Times: {len(pending_teams)} | Total: {total_work} (workers={N_WORKERS})")
+    args_list = [
+        (team, df[(df["home_team"] == team) | (df["away_team"] == team)], detector_products, K, window_ma)
+        for team in pending_teams
+        for window_ma in WINDOW_MA_OPTIONS
+    ]
+    print(f"Times: {len(pending_teams)} | Total: {len(args_list)} (workers={N_WORKERS})")
 
     if not pending_teams:
         print("Nada a processar.")
     else:
-        # Flatten: todas as combinações (team × window_ma × cooldown) em um único Pool
-        args_list = [
-            (team, df[(df["home_team"] == team) | (df["away_team"] == team)], detector_products, K, window_ma, cooldown)
-            for team in pending_teams
-            for window_ma, cooldown in product(WINDOW_MA_OPTIONS, COOLDOWN_OPTIONS)
-        ]
-        print(f"Total de unidades de trabalho: {len(args_list)} | Workers: {N_WORKERS}")
-
         batch_best, batch_side, batch_raw = [], [], []
-        BATCH_SIZE = 50  # grava a cada 50 resultados para reduzir I/O
+        BATCH_SIZE = 50
         done = 0
 
         with Pool(processes=N_WORKERS) as pool:
@@ -292,15 +297,13 @@ if __name__ == "__main__":
                 done += 1
                 team_name = df_best["team"].iloc[0]
                 ma = df_best["window_ma"].iloc[0]
-                cd = df_best["cooldown_minutes"].iloc[0]
-                print(f"  ✓ [{done}/{len(args_list)}] {team_name} (MA={ma}, cd={cd})")
+                print(f"  ✓ [{done}/{len(args_list)}] {team_name} (MA={ma})")
                 if done % BATCH_SIZE == 0:
                     append_parquet(pd.concat(batch_best, ignore_index=True), RESULTS_BEST_FILE)
                     append_parquet(pd.concat(batch_side, ignore_index=True), RESULTS_BEST_BY_SIDE_FILE)
                     append_parquet(pd.concat(batch_raw,  ignore_index=True), RESULTS_RAW_FILE)
                     batch_best, batch_side, batch_raw = [], [], []
 
-        # Grava restante
         if batch_best:
             append_parquet(pd.concat(batch_best, ignore_index=True), RESULTS_BEST_FILE)
             append_parquet(pd.concat(batch_side, ignore_index=True), RESULTS_BEST_BY_SIDE_FILE)
