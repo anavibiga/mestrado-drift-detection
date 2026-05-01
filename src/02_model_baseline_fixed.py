@@ -33,7 +33,7 @@ RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 INTERVAL_OPTIONS = [25]  # adicionando apenas o intervalo de 25 min
 
 K = 10
-N_WORKERS = 4
+N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
     ("attack", "open_play", "gol_open_play"),

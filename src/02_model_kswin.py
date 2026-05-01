@@ -26,7 +26,7 @@ BASE_NAME = "events_wide_minute.parquet"
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "data" / "processed" / BASE_NAME
 
-RESULTS_PATH = BASE_DIR / "results" / "meio_softed" / "02_model_kswin_meio_softed"
+RESULTS_PATH = BASE_DIR / "results" / "02_model_kswin"
 RESULTS_PATH.mkdir(parents=True, exist_ok=True)
 RESULTS_BEST_FILE = RESULTS_PATH / "results_best.parquet"
 RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"

@@ -1,7 +1,7 @@
 """
 Baseline Randomwalk: avaliação meia-pirâmide / SoftEd assimétrico - (janela [t-K, t], pico em t-K).
-Resultados em results/meio_softed/02_model_baseline_randomwalk_meio_softed/
-Análise em notebooks/meio_softed/
+Resultados em results/02_model_baseline_randomwalk_meio_softed/
+Análise em notebooks/
 """
 
 # =========================
@@ -34,7 +34,7 @@ RANDOM_SEED = 42       # reprodutibilidade
 N_RUNS = 10            # repetições para estimar variância do baseline aleatório
 
 K = 10
-N_WORKERS = 4
+N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
     ("attack", "open_play", "gol_open_play"),

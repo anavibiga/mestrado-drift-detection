@@ -39,7 +39,7 @@ COOLDOWN_OPTIONS = [3, 5, 10, 12, 15]
 K = 10
 # Warmup = 0 porque window_ma atua duplamente como janela da média móvel e como warmup
 WARMUP_MINUTES = 0
-N_WORKERS = 4
+N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
     ("attack", "open_play", "gol_open_play"),
