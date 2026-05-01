@@ -29,7 +29,7 @@ RESULTS_BEST_FILE = RESULTS_PATH / "results_best.parquet"
 RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"
 RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 
-TARGET_ALARMS = 8000   # igualado ao volume do Page-Hinkley para comparação justa
+TARGET_ALARMS = 12000  # calibrado para ~4000 alarmes após filtro best-per-team/task (1/3 das features é mantida)
 RANDOM_SEED = 42       # reprodutibilidade
 N_RUNS = 10            # repetições para estimar variância do baseline aleatório
 
@@ -78,54 +78,27 @@ def random_alarms(n_minutes, p, rng):
 def har_eval_soft_half_python(drift_series, label_series, k):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
-    Associação ótima alarme↔gol via Hungarian algorithm (scipy).
-    FP = 1 - score, FN = m - TP, TN = (t - m) - FP.
+    score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
+    FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
+    Não usa R/harbinger — avaliação puramente em Python.
     """
-    from scipy.optimize import linear_sum_assignment
     import numpy as np
-
     goal_pos  = np.where(np.array(label_series, dtype=bool))[0]
     alarm_pos = np.where(np.array(drift_series, dtype=bool))[0]
 
-    if len(alarm_pos) == 0 or len(goal_pos) == 0:
-        FP = float(len(alarm_pos))
-        FN = float(len(goal_pos))
-        TN = float(len(drift_series) - len(goal_pos)) - FP
-        return 0.0, FP, FN, TN
+    TP, FP, FN = 0.0, 0.0, 0.0
 
-    def score(a, t):
-        if (t - k) <= a <= t:
-            return 1.0 - (a - (t - k)) / k
-        return 0.0
+    for a in alarm_pos:
+        best = 0.0
+        for t in goal_pos:
+            if (t - k) <= a <= t:
+                best = max(best, 1.0 - (a - (t - k)) / k)
+        TP += best
+        FP += (1.0 - best)
 
-    segs = [[int(t) - k, int(t)] for t in goal_pos]
-    merged = [segs[0][:]]
-    for seg in segs[1:]:
-        if seg[0] <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], seg[1])
-        else:
-            merged.append(seg[:])
+    FN = len(goal_pos) - TP
 
-    S_d = np.zeros(len(alarm_pos))
-    for inf, sup in merged:
-        D_idx = np.where((alarm_pos >= inf) & (alarm_pos <= sup))[0]
-        E_idx = np.where((goal_pos  >= inf) & (goal_pos  <= sup))[0]
-        if len(D_idx) == 0:
-            continue
-        D_mini = alarm_pos[D_idx]
-        E_mini = goal_pos[E_idx]
-        if len(D_mini) == 1 and len(E_mini) == 1:
-            S_d[D_idx[0]] = score(D_mini[0], E_mini[0])
-        elif len(E_mini) >= 1:
-            Mu = np.array([[score(a, t) for t in E_mini] for a in D_mini])
-            row_ind, col_ind = linear_sum_assignment(-Mu)
-            for r, c in zip(row_ind, col_ind):
-                S_d[D_idx[r]] = Mu[r, c]
-
-    TP = float(np.sum(S_d))
-    FP = float(np.sum(1.0 - S_d))
-    FN = float(len(goal_pos)) - TP
-    TN = float(len(drift_series) - len(goal_pos)) - FP
+    TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
