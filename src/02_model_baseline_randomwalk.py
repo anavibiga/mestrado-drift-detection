@@ -33,7 +33,7 @@ TARGET_ALARMS = 12000  # calibrado para ~4000 alarmes após filtro best-per-team
 RANDOM_SEED = 42       # reprodutibilidade
 N_RUNS = 10            # repetições para estimar variância do baseline aleatório
 
-K = 10
+K = 5
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
@@ -79,9 +79,11 @@ def har_eval_soft_half_python(drift_series, label_series, k):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
     score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
-    FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
-    Não usa R/harbinger — avaliação puramente em Python.
+    Matching via Hungarian (n>1, m>1) ou max (n>1, m=1) para evitar que dois alarmes
+    cubram o mesmo gol — equivalente ao har_eval_soft_assimetrico do R/harbinger.
     """
+    from scipy.optimize import linear_sum_assignment
+
     drift_arr = np.array(drift_series, dtype=float)
     label_arr = np.array(label_series, dtype=float)
     drift_arr = np.where(np.isnan(drift_arr), 0.0, drift_arr).astype(bool)
@@ -89,27 +91,51 @@ def har_eval_soft_half_python(drift_series, label_series, k):
 
     goal_pos  = np.where(label_arr)[0]
     alarm_pos = np.where(drift_arr)[0]
+    effective_n = len(drift_series)
 
-    # caso extremo sem gols ou sem alarmes
-    # sem alarmes: TP, FP são 0, FN = len(goal_pos), TN = len(drift_series) - FN (#gols)
-    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = len(drift_series) - FP (#alarmes)
     if len(alarm_pos) == 0 or len(goal_pos) == 0:
         TP, FP = 0.0, float(len(alarm_pos))
         FN = float(len(goal_pos))
-        TN = float(len(drift_series) - len(goal_pos)) - FP
+        TN = float(effective_n - len(goal_pos)) - FP
         return TP, FP, FN, TN
 
-    TP, FP, FN = 0.0, 0.0, 0.0
+    def _score(a, t):
+        return 1.0 - (a - (t - k)) / k if (t - k) <= a <= t else 0.0
 
-    for a in alarm_pos:
-        score = 0.0
-        for t in goal_pos:
-            if (t - k) <= a <= t:
-                score = max(score, 1.0 - (a - (t - k)) / k)
-        TP += score
-        FP += (1.0 - score)
+    segs = sorted((int(t) - k, int(t)) for t in goal_pos)
+    merged, lo, hi = [], segs[0][0], segs[0][1]
+    for s, e in segs[1:]:
+        if s <= hi:
+            hi = max(hi, e)
+        else:
+            merged.append((lo, hi))
+            lo, hi = s, e
+    merged.append((lo, hi))
 
-    FN = len(goal_pos) - TP
+    S_d = np.zeros(len(alarm_pos))
+
+    for seg_lo, seg_hi in merged:
+        ai = np.where((alarm_pos >= seg_lo) & (alarm_pos <= seg_hi))[0]
+        gi = np.where((goal_pos  >= seg_lo) & (goal_pos  <= seg_hi))[0]
+        if len(ai) == 0 or len(gi) == 0:
+            continue
+
+        D, E = alarm_pos[ai], goal_pos[gi]
+        M = np.array([[_score(d, t) for t in E] for d in D])
+
+        if len(D) == 1:
+            S_d[ai[0]] = M[0].max()
+        elif len(E) == 1:
+            best = int(M[:, 0].argmax())
+            S_d[ai[best]] = M[best, 0]
+        else:
+            rows, cols = linear_sum_assignment(-M)
+            for r, c in zip(rows, cols):
+                S_d[ai[r]] = M[r, c]
+
+    TP = float(S_d.sum())
+    FP = float((1.0 - S_d).sum())
+    FN = float(len(goal_pos)) - TP
     TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 

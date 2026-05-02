@@ -19,6 +19,7 @@ from datetime import datetime
 from multiprocessing import Pool
 
 from river import drift
+from scipy.optimize import linear_sum_assignment
 
 # =========================
 # 1. CONFIG
@@ -37,7 +38,7 @@ RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 WINDOW_MA_OPTIONS = [3, 5, 10, 12, 15]
 COOLDOWN_OPTIONS = [3, 5, 10, 12, 15]
 
-K = 10
+K = 5
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
@@ -64,10 +65,12 @@ def compute_ma_per_period(series_per_period, window_ma=10):
     return pd.Series(arr).rolling(window=window_ma, min_periods=1).mean().values
 
 
-def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10):
+def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10, label_values=None):
     """
     Page-Hinkley na série já suavizada (MA) + cooldown + warmup.
     Só alimenta o detector a partir do índice window_ma (evita pico quando a MA completa), ou seja, window_ma funciona como warmup.
+    Se label_values for fornecido, o cooldown é zerado no minuto de cada gol para permitir
+    que o detector volte a alarmar imediatamente após o evento.
     """
     detector = drift.PageHinkley(**params)
     out_drift = []
@@ -75,7 +78,9 @@ def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10):
     ma_start = window_ma
 
     for i, v in enumerate(ma_values):
-        if cooldown_remaining > 0:
+        if label_values is not None and label_values[i]:
+            cooldown_remaining = 0
+        elif cooldown_remaining > 0:
             cooldown_remaining -= 1
         if i >= ma_start:
             detector.update(v)
@@ -88,7 +93,7 @@ def drift_detection_on_ma(ma_values, params, cooldown_minutes=10, window_ma=10):
             else:
                 out_drift.append(False)
         else:
-            out_drift.append(False)        
+            out_drift.append(False)
     return out_drift
 
 
@@ -96,53 +101,74 @@ def har_eval_soft_half_python(drift_series, label_series, k, window_ma=0):
     """
     Meia-pirâmide: janela [t-K, t], pico em t-K.
     score(alarme) = 1 - (alarme - (t-K)) / K  se alarme ∈ [t-K, t], senão 0.
-    FP = 1 - score para cada alarme (complementar ao TP), garantindo TP+FP+FN+TN = total de minutos.
-    Não usa R/harbinger — avaliação puramente em Python, pois harbinger não permitia usar a pirâmide parcialmente.
+    Matching via Hungarian (n>1, m>1) ou max (n>1, m=1) para evitar que dois alarmes
+    cubram o mesmo gol — equivalente ao har_eval_soft_assimetrico do R/harbinger.
     Os primeiros window_ma minutos de cada período são excluídos da análise (warmup da MA).
     """
 
-    # converte pra array e trata NaN
     drift_arr = np.array(drift_series, dtype=float)
     label_arr = np.array(label_series, dtype=float)
     drift_arr = np.where(np.isnan(drift_arr), 0.0, drift_arr).astype(bool)
     label_arr = np.where(np.isnan(label_arr), 0.0, label_arr).astype(bool)
 
-    # exclui primeiros window_ma minutos (warmup): posições originais preservadas
     goal_pos  = np.where(label_arr[window_ma:])[0] + window_ma
     alarm_pos = np.where(drift_arr[window_ma:])[0] + window_ma
     effective_n = len(drift_series) - window_ma
 
-    # caso extremo sem gols ou sem alarmes
-    # sem alarmes: TP, FP são 0, FN = len(goal_pos), TN = effective_n - FN (#gols)
-    # sem gols: TP, FN são 0, FP = len(alarm_pos), TN = effective_n - FP (#alarmes)
     if len(alarm_pos) == 0 or len(goal_pos) == 0:
         TP, FP = 0.0, float(len(alarm_pos))
         FN = float(len(goal_pos))
         TN = float(effective_n - len(goal_pos)) - FP
         return TP, FP, FN, TN
 
-    TP, FP, FN = 0.0, 0.0, 0.0
+    def _score(a, t):
+        return 1.0 - (a - (t - k)) / k if (t - k) <= a <= t else 0.0
 
-    # score sempre começa com 0
-    # max garante que se o alarme cobre múltiplos gols, pega o melhor score
-    for a in alarm_pos:
-        score = 0.0
-        for t in goal_pos:
-            if (t - k) <= a <= t:
-                score = max(score, 1.0 - (a - (t - k)) / k)
-        TP += score
-        FP += (1.0 - score)
+    # mescla janelas [t-k, t] sobrepostas em segmentos contíguos
+    segs = sorted((int(t) - k, int(t)) for t in goal_pos)
+    merged, lo, hi = [], segs[0][0], segs[0][1]
+    for s, e in segs[1:]:
+        if s <= hi:
+            hi = max(hi, e)
+        else:
+            merged.append((lo, hi))
+            lo, hi = s, e
+    merged.append((lo, hi))
 
-    FN = len(goal_pos) - TP
-    TN = (effective_n - len(goal_pos)) - FP
+    # S_d[i] = score do alarme i; começa em 0 (→ FP = 1 para alarmes sem gol)
+    S_d = np.zeros(len(alarm_pos))
+
+    for seg_lo, seg_hi in merged:
+        ai = np.where((alarm_pos >= seg_lo) & (alarm_pos <= seg_hi))[0]
+        gi = np.where((goal_pos  >= seg_lo) & (goal_pos  <= seg_hi))[0]
+        if len(ai) == 0 or len(gi) == 0:
+            continue
+
+        D, E = alarm_pos[ai], goal_pos[gi]
+        M = np.array([[_score(d, t) for t in E] for d in D])  # shape (n, m)
+
+        if len(D) == 1:
+            S_d[ai[0]] = M[0].max()
+        elif len(E) == 1:
+            best = int(M[:, 0].argmax())
+            S_d[ai[best]] = M[best, 0]
+        else:
+            rows, cols = linear_sum_assignment(-M)
+            for r, c in zip(rows, cols):
+                S_d[ai[r]] = M[r, c]
+
+    TP = float(S_d.sum())
+    FP = float((1.0 - S_d).sum())
+    FN = float(len(goal_pos)) - TP
+    TN = float(effective_n - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
 def get_detector_products():
     """Grid Page-Hinkley"""
     params = {
-        "min_instances": [10],
-        "threshold": [1, 3, 5, 7, 10],
+        "min_instances": [1, 3],
+        "threshold": [3, 5, 7, 10],
         "delta": [0.001, 0.005, 0.01],
         "alpha": [0.9, 0.95, 0.99],
         "mode": ["both"],
@@ -230,7 +256,8 @@ def run_team(df_team, team, detector_products, k, window_ma, cooldown_minutes):
                             mask = df_ctx["period"] == period
                             ma_vals = ma_series.loc[mask].tolist()
                             drifts = drift_detection_on_ma(
-                                ma_vals, det["params"], cooldown_minutes, window_ma
+                                ma_vals, det["params"], cooldown_minutes, window_ma,
+                                label_values=goal_series.loc[mask].tolist()
                             )
                             for i, idx in enumerate(df_ctx.loc[mask].index):
                                 drift_series.loc[idx] = drifts[i]
