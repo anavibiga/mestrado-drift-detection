@@ -1,7 +1,7 @@
 """
-Baseline Fixed: avaliação meia-pirâmide / SoftEd assimétrico - (janela [t-K, t], pico em t-K).
-Resultados em results/02_model_baseline_fixed/
-Análise em notebooks/
+Baseline Aleatório (Bernoulli): cada minuto emite alarme com probabilidade ALARM_PROB = 0.5,
+sem qualquer hipótese sobre os dados. Avaliação meia-pirâmide / SoftED assimétrico.
+Resultados em results/02_model_baseline_random/
 """
 
 # =========================
@@ -11,9 +11,7 @@ import pandas as pd
 import numpy as np
 import json
 import time
-import os
 from pathlib import Path
-from itertools import product
 from datetime import datetime
 from multiprocessing import Pool
 
@@ -24,16 +22,17 @@ BASE_NAME = "events_wide_minute.parquet"
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "data" / "processed" / BASE_NAME
 
-RESULTS_PATH = BASE_DIR / "results" / "02_model_baseline_fixed"
+RESULTS_PATH = BASE_DIR / "results" / "02_model_baseline_random"
 RESULTS_PATH.mkdir(parents=True, exist_ok=True)
 RESULTS_BEST_FILE = RESULTS_PATH / "results_best.parquet"
 RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"
 RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 
-# Grid de intervalos fixos (minutos entre alarmes)
-INTERVAL_OPTIONS = [22]
+ALARM_PROB = 0.5   # Bernoulli p=0.5: coin flip por minuto, sem hipótese sobre os dados
+RANDOM_SEED = 42   # reprodutibilidade
+N_RUNS = 10        # repetições para estimar variância do baseline aleatório
 
-K = 5
+K = 15
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
@@ -44,17 +43,14 @@ TASKS = [
 RUN_DATE = datetime.today().date().isoformat()
 TEAMS = None
 FORCE_RERUN = True
-TEST_LABEL = "baseline fixo meio_softed"
+TEST_LABEL = "baseline aleatorio Bernoulli p=0.5"
 
-# ==============================
+# =========================
 # 2. FUNCTIONS
-# ==============================
-def fixed_interval_alarms(n_minutes, interval_minutes):
-    """
-    Dispara True a cada 'interval_minutes' passos, independente do sinal.
-    Começa a contar do minuto 0 (primeiro alarme em interval_minutes - 1).
-    """
-    return [(i > 0 and i % interval_minutes == 0) for i in range(n_minutes)]
+# =========================
+def random_alarms(n_minutes, p, rng):
+    """Dispara True aleatoriamente com probabilidade p por minuto."""
+    return rng.random(n_minutes) < p
 
 
 def har_eval_soft_half_python(drift_series, label_series, k):
@@ -118,7 +114,7 @@ def har_eval_soft_half_python(drift_series, label_series, k):
     TP = float(S_d.sum())
     FP = float((1.0 - S_d).sum())
     FN = float(len(goal_pos)) - TP
-    TN = float(effective_n - len(goal_pos)) - FP
+    TN = (len(drift_series) - len(goal_pos)) - FP
     return TP, FP, FN, TN
 
 
@@ -129,7 +125,7 @@ def append_parquet(df_new, path):
         df_old = pd.read_parquet(path)
         df_new = pd.concat([df_old, df_new], ignore_index=True)
     first_cols = []
-    for col in ["run_id", "run_timestamp", "test_label", "interval_minutes", "side"]:
+    for col in ["run_id", "run_timestamp", "test_label", "run_number", "alarm_prob", "side"]:
         if col in df_new.columns:
             first_cols.append(col)
     if first_cols:
@@ -138,33 +134,38 @@ def append_parquet(df_new, path):
     df_new.to_parquet(path, index=False)
 
 
-def _agg_best(df_agg, group_cols):
+def _worker_run_team(args):
+    team, df_team, k, alarm_prob, run_number, seed = args
+    res = run_team(df_team, team, k, alarm_prob, run_number, seed)
+    res["params"] = res["params"].astype(str)
+
+    df_agg = (
+        res.groupby(["team", "task", "goal_type", "feature", "detector", "params", "run_number"], as_index=False)
+        .agg(TP_sum=("TP", "sum"), FP_sum=("FP", "sum"), FN_sum=("FN", "sum"), TN_sum=("TN", "sum"))
+    )
     df_agg["precision"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FP_sum"])
     df_agg["recall"] = df_agg["TP_sum"] / (df_agg["TP_sum"] + df_agg["FN_sum"])
     df_agg["f1"] = 2 * df_agg["precision"] * df_agg["recall"] / (df_agg["precision"] + df_agg["recall"])
     df_agg = df_agg.fillna(0)
-    best_idx = df_agg.groupby(group_cols)["f1"].idxmax()
-    return df_agg.loc[best_idx].copy()
+    df_agg["alarm_prob"] = alarm_prob
 
-
-def _worker_run_team(args):
-    team, df_team, k, interval_minutes = args
-    res = run_team(df_team, team, k, interval_minutes)
-    res["params"] = res["params"].astype(str)
-    df_agg = (
-        res.groupby(["team", "task", "goal_type", "feature", "detector", "params", "interval_minutes"], as_index=False)
-        .agg(TP_sum=("TP", "sum"), FP_sum=("FP", "sum"), FN_sum=("FN", "sum"), TN_sum=("TN", "sum"))
-    )
-    df_best = _agg_best(df_agg, ["team", "task", "goal_type"])
     df_agg_side = (
-        res.groupby(["team", "task", "goal_type", "side", "feature", "detector", "params", "interval_minutes"], as_index=False)
+        res.groupby(["team", "task", "goal_type", "side", "feature", "detector", "params", "run_number"], as_index=False)
         .agg(TP_sum=("TP", "sum"), FP_sum=("FP", "sum"), FN_sum=("FN", "sum"), TN_sum=("TN", "sum"))
     )
-    df_best_side = _agg_best(df_agg_side, ["team", "task", "goal_type", "side"])
-    return df_best, df_best_side, res
+    df_agg_side["precision"] = df_agg_side["TP_sum"] / (df_agg_side["TP_sum"] + df_agg_side["FP_sum"])
+    df_agg_side["recall"] = df_agg_side["TP_sum"] / (df_agg_side["TP_sum"] + df_agg_side["FN_sum"])
+    df_agg_side["f1"] = 2 * df_agg_side["precision"] * df_agg_side["recall"] / (df_agg_side["precision"] + df_agg_side["recall"])
+    df_agg_side = df_agg_side.fillna(0)
+    df_agg_side["alarm_prob"] = alarm_prob
+
+    return df_agg, df_agg_side, res
 
 
-def run_team(df_team, team, k, interval_minutes):
+def run_team(df_team, team, k, alarm_prob, run_number, seed):
+    team_seed = seed + run_number * 10000 + hash(team) % 10000
+    rng = np.random.default_rng(team_seed)
+
     results = []
     for match_id in df_team["match_id"].unique():
         df_match = df_team[df_team["match_id"] == match_id]
@@ -186,7 +187,7 @@ def run_team(df_team, team, k, interval_minutes):
                     for period in sorted(df_ctx["period"].unique()):
                         mask = df_ctx["period"] == period
                         n = mask.sum()
-                        alarms = fixed_interval_alarms(n, interval_minutes)
+                        alarms = random_alarms(n, alarm_prob, rng)
                         for i, idx in enumerate(df_ctx.loc[mask].index):
                             drift_series.loc[idx] = alarms[i]
                     drift_series = drift_series.astype(bool)
@@ -200,29 +201,32 @@ def run_team(df_team, team, k, interval_minutes):
                     results.append({
                         "run_date": RUN_DATE,
                         "match_id": match_id,
+                        "run_number": run_number,
                         "team": team,
                         "task": task,
                         "goal_type": goal_type,
                         "side": side,
                         "feature": feature,
-                        "detector": "FixedInterval",
-                        "params": json.dumps({"interval_minutes": interval_minutes}),
-                        "interval_minutes": interval_minutes,
+                        "detector": "RandomBernoulli",
+                        "params": json.dumps({"alarm_prob": alarm_prob, "seed": seed}),
+                        "alarm_prob": alarm_prob,
                         "TP": TP, "FP": FP, "FN": FN, "TN": TN,
                     })
     return pd.DataFrame(results)
 
-# ==============================
+
+# =========================
 # 3. MAIN
-# ==============================
+# =========================
 if __name__ == "__main__":
-    print("=== 02_model: Baseline alarmes fixos ===")
-    print(f"Intervalos testados: {INTERVAL_OPTIONS} minutos")
+    print("=== 02_model: Baseline Aleatório (Bernoulli p=0.5) ===")
+    print(f"p = {ALARM_PROB} | Seed: {RANDOM_SEED} | Runs: {N_RUNS}")
     print(f"Resultados: {RESULTS_BEST_FILE}")
 
     start = time.time()
     run_timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
-    run_id = f"v7_{run_timestamp}"
+    run_id = f"baseline_random_{run_timestamp}"
+
     df = pd.read_parquet(DATA_PATH)
     teams = (
         pd.unique(df[["home_team", "away_team"]].values.ravel()).tolist()
@@ -234,17 +238,18 @@ if __name__ == "__main__":
         if RESULTS_BEST_FILE.exists() else teams
     )
 
-    print(f"Times: {len(pending_teams)} | Intervalos: {len(INTERVAL_OPTIONS)} | Workers: {N_WORKERS}")
+    print(f"Times: {len(pending_teams)} | Runs: {N_RUNS} | Workers: {N_WORKERS}")
 
-    for interval in INTERVAL_OPTIONS:
-        print(f"\n--- Intervalo fixo = {interval} min ---")
+    for run_number in range(N_RUNS):
+        print(f"\n--- Run {run_number + 1}/{N_RUNS} ---")
         args_list = [
-            (team, df[(df["home_team"] == team) | (df["away_team"] == team)], K, interval)
+            (team, df[(df["home_team"] == team) | (df["away_team"] == team)],
+             K, ALARM_PROB, run_number, RANDOM_SEED)
             for team in pending_teams
         ]
         with Pool(processes=N_WORKERS) as pool:
-            for df_best, df_best_side, df_raw in pool.imap_unordered(_worker_run_team, args_list, chunksize=1):
-                for dfp, path in [(df_best, RESULTS_BEST_FILE), (df_best_side, RESULTS_BEST_BY_SIDE_FILE)]:
+            for df_agg, df_agg_side, df_raw in pool.imap_unordered(_worker_run_team, args_list, chunksize=1):
+                for dfp, path in [(df_agg, RESULTS_BEST_FILE), (df_agg_side, RESULTS_BEST_BY_SIDE_FILE)]:
                     dfp.insert(0, "test_label", TEST_LABEL)
                     dfp.insert(0, "run_timestamp", run_timestamp)
                     dfp.insert(0, "run_id", run_id)
@@ -252,7 +257,7 @@ if __name__ == "__main__":
                 df_raw.insert(0, "test_label", TEST_LABEL)
                 df_raw.insert(0, "run_timestamp", run_timestamp)
                 append_parquet(df_raw, RESULTS_RAW_FILE)
-                print(f"  ✓ {df_best['team'].iloc[0]} (intervalo={interval} min)")
+                print(f"  ✓ {df_agg['team'].iloc[0]} (run={run_number + 1})")
 
     print(f"\nTempo total: {(time.time() - start)/60:.1f} min")
     print(f"Salvo em: {RESULTS_BEST_FILE}")

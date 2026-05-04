@@ -35,8 +35,8 @@ RESULTS_BEST_BY_SIDE_FILE = RESULTS_PATH / "results_best_by_side.parquet"
 RESULTS_RAW_FILE = RESULTS_PATH / "results_raw.parquet"
 
 # Configurações do Warmup e do Cooldown
-WINDOW_MA_OPTIONS = [3, 5, 10, 12, 15]
-COOLDOWN_OPTIONS = [3, 5, 10, 12, 15]
+WINDOW_MA_OPTIONS = [3, 5, 10, 12]
+COOLDOWN_OPTIONS = [3, 5]
 
 K = 5
 
