@@ -32,7 +32,7 @@ ALARM_PROB = 0.5   # Bernoulli p=0.5: coin flip por minuto, sem hipótese sobre 
 RANDOM_SEED = 42   # reprodutibilidade
 N_RUNS = 10        # repetições para estimar variância do baseline aleatório
 
-K = 15
+K = 5
 N_WORKERS = 7
 FEATURES = ["passe", "passe_certo", "passe_errado"]
 TASKS = [
