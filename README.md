@@ -16,18 +16,21 @@ O problema é formulado como detecção de drift em séries temporais: dado o vo
 │   ├── open-data/          # StatsBomb Open Data (ver nota abaixo)
 │   └── processed/          # Dados processados (formato wide por minuto)
 ├── src/
-│   ├── 01_feature_engineering.py       # Gera events_wide_minute.parquet
-│   ├── 02_model_adwin.py               # Detector ADWIN
-│   ├── 02_model_kswin.py               # Detector KSWIN
-│   ├── 02_model_page_hinkley.py        # Detector Page-Hinkley
-│   ├── 02_model_baseline_fixed.py      # Baseline: limiar fixo
-│   └── 02_model_baseline_randomwalk.py # Baseline: random walk
+│   ├── 01_feature_engineering.py          # Gera events_wide_minute.parquet
+│   ├── 02_model_adwin.py                  # Detector ADWIN
+│   ├── 02_model_kswin.py                  # Detector KSWIN
+│   ├── 02_model_page_hinkley.py           # Detector Page-Hinkley
+│   ├── 02_model_baseline_fixed.py         # Baseline: limiar fixo
+│   └── 02_model_baseline_random.py        # Baseline: aleatório
 ├── notebooks/
-│   ├── 01_data_sanity_check.ipynb      # Validação dos dados brutos
-│   ├── 02_eda_laliga.ipynb             # Análise exploratória
-│   └── 03_analise_resultados.ipynb     # Avaliação dos detectores
-├── results/                            # Resultados por modelo (.parquet)
-└── figures/                            # Figuras geradas para a dissertação
+│   ├── 01_data_sanity_check.ipynb         # Validação dos dados brutos
+│   ├── 02_eda_laliga.ipynb                # Análise exploratória
+│   ├── 03_comparacao_detectores.ipynb     # Comparação detectores por janela de avaliação (K)
+│   ├── 04_analise_resultados_v5k5.ipynb   # Análise de resultados para janela K=5
+│   ├── 04_analise_resultados_v5k10.ipynb  # Análise de resultados para janela K=10
+│   └── 04_analise_resultados_v5k15.ipynb  # Análise de resultados para janela K=15
+├── results/                               # Resultados por modelo (.parquet)
+└── figures/                               # Figuras geradas para a dissertação
 ```
 
 ### Sobre os dados (`data/`)
@@ -42,8 +45,11 @@ Os dados brutos são provenientes do [repositório público do StatsBomb](https:
 2. **Execução dos modelos** (`src/02_model_*.py`)
    Cada script roda um detector sobre a série temporal de eventos, usando uma janela deslizante com avaliação assimétrica (meia-pirâmide / SoftEd). Resultados salvos em `results/<modelo>/`.
 
-3. **Análise** (`notebooks/03_analise_resultados.ipynb`)
-   Compara os detectores via F1, MCC, curva precision-recall e análise de alarmes falsos.
+3. **Comparação** (`notebooks/03_comparação_detectores.ipynb`)
+   Compara as janelas de avaliação (K) de acordo com os resultados obtidos em cada detector.
+
+4. **Análise** (`notebooks/04_analise_resultados_v5k*.ipynb`)
+   Compara os detectores via F1, MCC, curva precision-recall e análise de alarmes falsos para diferentes janelas de avaliação (K).
 
 ## Detectores avaliados
 
@@ -53,7 +59,7 @@ Os dados brutos são provenientes do [repositório público do StatsBomb](https:
 | KSWIN | `river` |
 | Page-Hinkley | `river` |
 | Baseline fixo | — |
-| Baseline random walk | — |
+| Baseline aleatório | — |
 
 ## Features
 
